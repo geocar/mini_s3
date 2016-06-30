@@ -24,6 +24,7 @@
 -export([new/2,
          new/3,
          new/4,
+         credentials/1,
          create_bucket/3,
          create_bucket/4,
          delete_bucket/1,
@@ -138,6 +139,27 @@ new(AccessKeyID, SecretAccessKey, Host, BucketAccessType) ->
      s3_url=Host,
      bucket_access_type=BucketAccessType}.
 
+-define(OVERLAPIAM, 3600).
+
+credentials(Name) when is_list(Name) ->
+    Info = imds_json("meta-data/iam/security-credentials/" ++ Name),
+    Region = proplists:get_value(<<"region">>, imds_json("dynamic/instance-identity/document")),
+    Expiration = proplists:get_value(<<"Expiration">>, Info),
+    #config{
+     access_key_id = proplists:get_value(<<"AccessKeyId">>, Info),
+     secret_access_key = proplists:get_value(<<"SecretAccessKey">>, Info),
+     s3_url="https://s3-" ++ to_string(Region) ++ ".amazonaws.com",
+     imds_role = Name,
+     token=proplists:get_value(<<"Token">>, Info),
+     expires = (case is_binary(Expiration) of true -> calendar:datetime_to_gregorian_seconds(iso8601:parse(Expiration)); _ -> undefined end)};
+credentials(Config = #config{expires=Expires, imds_role=Name}) when is_integer(Expires) ->
+  Now = calendar:datetime_to_gregorian_seconds(erlang:universaltime()) - ?OVERLAPIAM,
+  case Now > Expires of true -> Config; false -> credentials(Name) end;
+credentials(Config = #config{}) -> Config.
+
+imds_json(Path) ->
+    {ok, "200", _, Body} = ibrowse:send_req("http://169.254.169.254/latest/" ++ Path, [], get),
+    jsone:decode(Body, [{object_format,proplist}]).
 
 
 -define(XMLNS_S3, "http://s3.amazonaws.com/doc/2006-03-01/").
@@ -826,8 +848,12 @@ s3_xml_request(Config, Method, Host, Path, Subresource, Params, POSTData, Header
     end.
 
 s3_request(Config = #config{access_key_id=AccessKey,
-                            secret_access_key=SecretKey},
-           Method, Host, Path, Subresource, Params, POSTData, Headers) ->
+                            secret_access_key=SecretKey,
+                            token=Token},
+           Method, Host, Path, Subresource, Params, POSTData, OriginalHeaders) ->
+    Headers=case Token of 
+        undefined -> OriginalHeaders;
+        _ -> OriginalHeaders ++ [{"x-amz-security-token", Token}] end,
     {ContentMD5, ContentType, Body} =
         case POSTData of
             {PD, CT} ->
